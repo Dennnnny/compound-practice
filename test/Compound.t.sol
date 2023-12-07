@@ -17,25 +17,33 @@ import {UnderlyingToken} from "../script/Compound.s.sol";
 
 // import {Compound} from "../script/Compound.s.sol";
 
+contract anotherErc20 is ERC20 {
+    constructor() ERC20("Another Underlying Token", "AULTK") {}
+}
+
 contract CompoundTest is Test {
     //
-    ERC20 public underlyingToken;
-    CErc20Delegator public cToken;
+    ERC20 public tokenA;
+    ERC20 public tokenB;
+    CErc20Delegator public cToken_A;
+    CErc20Delegator public cToken_B;
     CErc20Delegate public cErc20Delegate;
     WhitePaperInterestRateModel public whitePaperInterestRateModel;
     Unitroller public unitroller;
     Comptroller public comptroller;
     Comptroller public unitrollerProxy;
     SimplePriceOracle public simplePriceOracle;
+    Comptroller public comptrollerProxy;
 
     address ADMIN = makeAddr("admin");
-    address userA = makeAddr("userA");
+    address user1 = makeAddr("user1");
+    address supplier = makeAddr("supplier");
+    address[] tokens = new address[](2);
 
     function setUp() public {
-        // vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
-
+        vm.startPrank(ADMIN);
         // make a underlying erc20 token
-        underlyingToken = new UnderlyingToken();
+        tokenA = new UnderlyingToken();
 
         // a unitroller
         unitroller = new Unitroller();
@@ -51,7 +59,7 @@ contract CompoundTest is Test {
         comptroller._become(unitroller);
 
         // setup comptroller proxy
-        Comptroller comptrollerProxy = Comptroller(address(unitroller));
+        comptrollerProxy = Comptroller(address(unitroller));
         comptrollerProxy._setPriceOracle(simplePriceOracle);
         // comptrollerProxy
 
@@ -60,8 +68,8 @@ contract CompoundTest is Test {
 
         cErc20Delegate = new CErc20Delegate();
 
-        cToken = new CErc20Delegator(
-            address(underlyingToken),
+        cToken_A = new CErc20Delegator(
+            address(tokenA),
             comptrollerProxy,
             whitePaperInterestRateModel,
             1e18, //exchange rate, which scaled by 1e18
@@ -73,29 +81,120 @@ contract CompoundTest is Test {
             bytes("0")
         );
 
-        deal(address(underlyingToken), userA, 100 ether);
+        comptrollerProxy._supportMarket(CToken(address(cToken_A)));
+    }
 
-        comptrollerProxy._supportMarket(CToken(address(cToken)));
+    /// this is prepare for question 3,
+    /// make another erc20, and making the setup part
+    /// 部署第二份 cERC20 合約，以下稱它們的 underlying tokens 為 token A 與 token B。
+    function prepare() public {
+        vm.startPrank(ADMIN);
+        // this is tokenB
+        tokenB = new anotherErc20();
+
+        // cToken_B
+        cToken_B = new CErc20Delegator(
+            address(tokenB),
+            comptrollerProxy,
+            whitePaperInterestRateModel,
+            1e18, //exchange rate, which scaled by 1e18
+            "Compound Token B",
+            "cTokenB",
+            18, //decimal
+            payable(ADMIN),
+            address(cErc20Delegate),
+            bytes("0")
+        );
+
+        comptrollerProxy._supportMarket(CToken(address(cToken_B)));
+
+        // 在 Oracle 中設定一顆 token A 的價格為 $1，一顆 token B 的價格為 $100
+        simplePriceOracle.setUnderlyingPrice(CToken(address(cToken_A)), 1e18);
+        simplePriceOracle.setUnderlyingPrice(CToken(address(cToken_B)), 100e18);
+
+        // Token B 的 collateral factor 為 50%
+        comptrollerProxy._setCollateralFactor(
+            CToken(address(cToken_B)),
+            0.5e18
+        );
+
+        vm.stopPrank();
     }
 
     function testMintAndRedeem() public {
-        vm.startPrank(userA);
+        deal(address(tokenA), user1, 100e18);
+        vm.startPrank(user1);
 
-        assertEq(underlyingToken.balanceOf(userA), 100 ether);
-        assertEq(cToken.balanceOf(userA), 0 ether);
+        assertEq(tokenA.balanceOf(user1), 100e18);
+        assertEq(cToken_A.balanceOf(user1), 0e18);
 
-        underlyingToken.approve(address(cToken), type(uint256).max);
-        uint mint_success = cToken.mint(100 ether);
+        tokenA.approve(address(cToken_A), type(uint256).max);
+        {
+            uint success = cToken_A.mint(100e18);
+            require(success == 0, "cToken_A mint fail");
+            assertEq(cToken_A.balanceOf(user1), 100e18);
+            assertEq(tokenA.balanceOf(user1), 0e18);
+        }
+        {
+            uint success = cToken_A.redeem(100e18);
+            require(success == 0, "cToken_A redeem fail");
+            assertEq(cToken_A.balanceOf(user1), 0e18);
+            assertEq(tokenA.balanceOf(user1), 100e18);
+        }
+        vm.stopPrank();
+    }
 
-        require(mint_success == 0, "ctoken mint fail");
-        assertEq(cToken.balanceOf(userA), 100 ether);
-        assertEq(underlyingToken.balanceOf(userA), 0 ether);
+    function testBorrowAndRepay() public {
+        prepare();
 
-        uint redeem_success = cToken.redeem(100 ether);
-        require(redeem_success == 0, "ctoken redeem fail");
-        assertEq(cToken.balanceOf(userA), 0 ether);
-        assertEq(underlyingToken.balanceOf(userA), 100 ether);
+        // make someone mint in tokenA first
+        deal(address(tokenA), supplier, 100e18);
+        vm.startPrank(supplier);
+        tokenA.approve(address(cToken_A), type(uint256).max);
+        {
+            uint success = cToken_A.mint(100e18);
+            require(success == 0, "cToken_A mint fail");
+        }
+        vm.stopPrank();
+
+        // give user1 1 tokenB
+        deal(address(tokenB), user1, 1 ether);
+        // * User1 使用 1 顆 token B 來 mint cToken => user1 把 1顆 tokenB 轉進去 並且 enabled tokenB
+        // -> 會得到 1顆 cToken_B, 少1顆 tokenB
+
+        // * User1 使用 token B 作為抵押品來借出 50 顆 token A => 需要有一個人先把 tokenA 放個100顆
+        // -> mint 得到 50 顆 tokenA，
+
+        vm.startPrank(user1);
+
+        tokenB.approve(address(cToken_B), type(uint256).max);
+        {
+            uint success = cToken_B.mint(1e18);
+            require(success == 0, "ctoken_B mint fail");
+
+            tokens[0] = address(cToken_A);
+            tokens[1] = address(cToken_B);
+            comptrollerProxy.enterMarkets(tokens);
+        }
+
+        {
+            uint success = cToken_A.borrow(50e18);
+            require(success == 0, "cToken_A borrow fail");
+        }
+
+        assertEq(tokenA.balanceOf(user1), 50e18);
+        assertEq(tokenB.balanceOf(user1), 0);
 
         vm.stopPrank();
+    }
+
+    function testLiquidation_collateral_factor() public {
+        // 延續 (3.) 的借貸場景，調整 token B 的 collateral factor，讓 User1 被 User2 清算
+        // => 調降collateral -> 能借出的就該變少 -> 30% 能借30顆 但身上有50顆 -> 清算
+    }
+
+    function testLiquidation_oracle_price() public {
+        // 5. 延續 (3.) 的借貸場景，調整 oracle 中 token B 的價格，讓 User1 被 User2 清算
+        // => 把tokenB 價格調低 -> token B 價值變低： 原本50% factor 可以接50顆 -> 現在25顆 ， 但身上還有50顆 = 清算
     }
 }
