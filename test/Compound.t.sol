@@ -263,6 +263,61 @@ contract CompoundTest is Test {
 
     function testLiquidation_oracle_price() public {
         // 5. 延續 (3.) 的借貸場景，調整 oracle 中 token B 的價格，讓 User1 被 User2 清算
-        // => 把tokenB 價格調低 -> token B 價值變低： 原本50% factor 可以接50顆 -> 現在25顆 ， 但身上還有50顆 = 清算
+        // => 把tokenB 價格調低 -> token B 價值變低： 原本100$/50% factor 可以接50顆 -> 現在50$/50% : 25顆 ， 但身上還有50顆 = 清算
+        testBorrowAndRepay();
+        vm.startPrank(ADMIN);
+        {
+            simplePriceOracle.setUnderlyingPrice(
+                CToken(address(cToken_B)),
+                50e18
+            );
+        }
+        vm.stopPrank();
+        uint borrowAmount = cToken_A.borrowBalanceStored(user1);
+        // give money to liquidator to liquidate
+        deal(address(tokenA), liquidator, 25e18);
+
+        vm.startPrank(liquidator);
+        {
+            (uint code, uint liquidity, uint shortfall) = comptrollerProxy
+                .getAccountLiquidity(user1);
+
+            require(
+                shortfall > 0,
+                "shortfall must greater than 0 to do the liquidation"
+            );
+        }
+
+        tokenA.approve(address(cToken_A), type(uint256).max);
+        {
+            uint success = cToken_A.liquidateBorrow(
+                user1,
+                borrowAmount / 2,
+                cToken_B
+            );
+            require(success == 0, "liquidateBorrow fail");
+        }
+        // 獎勵
+        (uint success, uint seizeTokens) = comptrollerProxy
+            .liquidateCalculateSeizeTokens(
+                address(cToken_A),
+                address(cToken_B),
+                borrowAmount / 2
+            );
+
+        // user1 會剩下的抵押品量為扣除獎勵與清算價值後：
+        assertEq(cToken_B.balanceOf(user1), (1e18 - seizeTokens));
+
+        // liquidator 得到的則是 獎勵扣除 分給協議的：
+        assertEq(
+            cToken_B.balanceOf(liquidator),
+            ((seizeTokens) * (1e18 - cToken_A.protocolSeizeShareMantissa())) /
+                1e18
+        );
+
+        // 發現在某些價格之下 例如 70$ , 用『balanceOf算出來的數量』與 用『seizeToken減去協議獎勵算出來的數量』
+        // 會有誤差，感覺是 rounddown 造成的 但我沒有找出不會有誤差的計算公式Ｑ＿Ｑ
+
+        vm.stopPrank();
     }
 }
