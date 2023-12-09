@@ -38,6 +38,7 @@ contract CompoundTest is Test {
     address ADMIN = makeAddr("admin");
     address user1 = makeAddr("user1");
     address supplier = makeAddr("supplier");
+    address liquidator = makeAddr("liquidator");
     address[] tokens = new address[](2);
 
     function setUp() public {
@@ -82,6 +83,14 @@ contract CompoundTest is Test {
         );
 
         comptrollerProxy._supportMarket(CToken(address(cToken_A)));
+        {
+            uint success = comptrollerProxy._setCloseFactor(0.5e18);
+            require(success == 0, "set close factor fail");
+        }
+        {
+            uint success = comptrollerProxy._setLiquidationIncentive(1.1e18);
+            require(success == 0, "set incentive fail");
+        }
     }
 
     /// this is prepare for question 3,
@@ -191,6 +200,65 @@ contract CompoundTest is Test {
     function testLiquidation_collateral_factor() public {
         // 延續 (3.) 的借貸場景，調整 token B 的 collateral factor，讓 User1 被 User2 清算
         // => 調降collateral -> 能借出的就該變少 -> 30% 能借30顆 但身上有50顆 -> 清算
+
+        // user1 持有 tokenA 50顆
+        // 延續#3
+        testBorrowAndRepay();
+
+        // 調低 collateral factor 0.5 -> 0.3
+        vm.startPrank(ADMIN);
+        {
+            uint success = comptrollerProxy._setCollateralFactor(
+                CToken(address(cToken_B)),
+                0.3e18
+            );
+            require(success == 0, "set collateral factor fail");
+        }
+
+        vm.stopPrank();
+        uint borrowAmount = cToken_A.borrowBalanceCurrent(user1);
+
+        // give money to liquidator to liquidate
+        deal(address(tokenA), liquidator, 25e18);
+
+        vm.startPrank(liquidator);
+
+        tokenA.approve(address(cToken_A), type(uint256).max);
+        {
+            (uint code, uint liquidity, uint shortfall) = comptrollerProxy
+                .getAccountLiquidity(user1);
+            require(
+                shortfall > 0,
+                "shortfall must greater than 0 to do the liquidation"
+            );
+        }
+        {
+            uint success = cToken_A.liquidateBorrow(
+                user1,
+                borrowAmount / 2,
+                cToken_B
+            );
+            require(success == 0, "liquidateBorrow fail");
+        }
+
+        // 計算清算獎勵 (包含協議的獎勵)
+        (uint success, uint seizeTokens) = comptrollerProxy
+            .liquidateCalculateSeizeTokens(
+                address(cToken_A),
+                address(cToken_B),
+                borrowAmount / 2
+            );
+
+        // user1 會剩下的抵押品量為扣除獎勵與清算價值後：
+        assertEq(cToken_B.balanceOf(user1), (1e18 - seizeTokens));
+
+        // liquidator 得到的則是 獎勵扣除 分給協議的：
+        assertEq(
+            cToken_B.balanceOf(liquidator),
+            (seizeTokens * (1e18 - cToken_A.protocolSeizeShareMantissa())) /
+                1e18
+        );
+        vm.stopPrank();
     }
 
     function testLiquidation_oracle_price() public {
